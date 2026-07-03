@@ -1,0 +1,161 @@
+# 1. Connect and create the database
+psql -h localhost -U postgres
+CREATE DATABASE cvedb;
+\q
+
+# 2. Apply the schema (creates the 5 tables)
+psql -h localhost -U postgres -d cvedb -f schema.sql
+
+# 3. Set up Python env + dependency (one-time)
+python3 -m venv .venv
+source .venv/bin/activate
+pip install psycopg2-binary
+
+# 4. Load the data
+python load_cves.py \
+  --dsn "postgresql://postgres:PASSWORD@localhost:5432/cvedb" \
+  --path 2026-07-02_delta_CVEs_at_0100Z.zip
+
+# 5. Verify
+psql -h localhost -U postgres -d cvedb -c "SELECT count(*) FROM cves;"
+
+Install pgvector extension - but due to EBD existing postgres its becoming difficult so instead doing it in docker only straight away.
+
+# ── Phase 0 + pgvector setup (all via Docker) ──
+
+# 1. Start Postgres (auto-creates cvedb, applies schema.sql, then 01_pgvector.sql)
+docker compose up -d postgres
+docker compose ps                      # wait for status "Up (healthy)"
+
+# 2. Confirm pgvector is enabled
+docker compose exec postgres psql -U cve -d cvedb -c "SELECT extname FROM pg_extension;"
+# -> should list "vector"
+
+# 3. Python env (one-time create; activate each new terminal)
+python3 -m venv .venv
+source .venv/bin/activate
+pip install psycopg2-binary
+
+# 4. Load the data  (NOTE: port 5433, user/pass cve/cve — the Docker DB)
+python load_cves.py \
+  --dsn "postgresql://cve:cve@localhost:5433/cvedb" \
+  --path 2026-07-02_delta_CVEs_at_0100Z.zip
+
+# 5. Verify
+docker compose exec postgres psql -U cve -d cvedb -c "SELECT count(*) FROM cves;"
+# -> should print 30
+
+# ── Phase 1: Embedding Pipeline + RAG Setup ──
+
+# 6. Install Ollama (one-time)
+brew install ollama
+# OR download from https://ollama.com/download
+
+# 7. Start the Ollama server
+ollama serve
+
+# (Open another terminal and keep the above terminal running)
+
+# 8. Download the embedding and chat models (one-time)
+ollama pull nomic-embed-text
+ollama pull llama3.2
+
+# 9. Verify the models
+ollama list
+# -> should list:
+#    nomic-embed-text
+#    llama3.2
+
+# 10. Install additional Python packages
+source .venv/bin/activate
+
+pip install \
+    ollama \
+    python-dotenv \
+    tqdm
+
+# 11. Create a .env file
+# (Place this in the project root)
+
+DB_HOST=localhost
+DB_PORT=5433
+DB_NAME=cvedb
+DB_USER=cve
+DB_PASSWORD=cve
+
+EMBED_MODEL=nomic-embed-text
+CHAT_MODEL=llama3.2
+
+TOP_K=5
+SIMILARITY_THRESHOLD=0.60
+
+# 12. Generate embeddings for every CVE
+python embed_cves.py
+
+# -> Reads all rows with embedding IS NULL
+# -> Generates embeddings using Ollama
+# -> Stores vectors inside PostgreSQL
+
+# 13. Verify embeddings were stored
+docker compose exec postgres \
+psql -U cve -d cvedb \
+-c "SELECT COUNT(*) FROM cves WHERE embedding IS NOT NULL;"
+# -> should print 30
+
+# 14. Verify vector search works (optional)
+docker compose exec postgres \
+psql -U cve -d cvedb
+
+SELECT
+    cve_id,
+    title
+FROM cves
+ORDER BY embedding <=> embedding
+LIMIT 5;
+
+\q
+
+# 15. Start the RAG application
+python app.py
+
+# Example questions:
+# What is CVE-2026-14388?
+# Describe CVE-2026-14391.
+# Show Chrome vulnerabilities.
+# Find use-after-free vulnerabilities.
+# Summarize the vulnerabilities currently in the database.
+
+
+CVE delta ZIP
+    │
+    ▼
+load_cves.py
+    │
+    ▼
+PostgreSQL + pgvector
+    │
+    ▼
+embed_cves.py
+    │
+    ▼
+Generate embeddings using Ollama
+    │
+    ▼
+Store vectors in PostgreSQL
+    │
+    ▼
+app.py
+    │
+    ▼
+User asks a question
+    │
+    ▼
+Exact SQL lookup (if a CVE ID is detected)
+         OR
+Vector similarity search (pgvector)
+    │
+    ▼
+Retrieve relevant CVEs
+    │
+    ▼
+llama3.2 generates the final answer
